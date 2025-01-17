@@ -7,7 +7,7 @@ const schedule = require('node-schedule');
 require('dotenv').config();
 
 // Основные настройки
-const token = process.env.TELEGRAM_TOKEN;
+const token = process.env.TELEGRAM_BOT_TOKEN;
 const admins = [1301142907, 225496853, 246813579];
 const bot = new TelegramBot(token, { polling: true });
 const openai = new OpenAI({
@@ -19,7 +19,7 @@ const db = new sqlite3.Database('./survey.db', (err) => {
     if (err) {
         console.error('Ошибка подключения к базе данных:', err.message);
     } else {
-        console.log('Подключение к базе данных SQLite успешно.');
+        // console.log('Подключение к базе данных SQLite успешно.');
         initializeDatabase();
     }
 });
@@ -42,6 +42,7 @@ function initializeDatabase() {
             test2_answers TEXT,
             test3_answers TEXT,
             test4_answers TEXT,
+            recommendation TEXT,
             message_id INTEGER
         )
     `;
@@ -50,7 +51,15 @@ function initializeDatabase() {
         if (err) {
             console.error('Ошибка при создании таблицы:', err);
         } else {
-            console.log('Таблица responses успешно создана или уже существует.');
+            // console.log('Таблица responses успешно создана или уже существует.');
+            // Проверим структуру таблицы
+            db.all("PRAGMA table_info(responses);", [], (err, rows) => {
+                if (err) {
+                    console.error('Ошибка при проверке структуры таблицы:', err);
+                } else {
+                    // console.log('Структура таблицы:', rows);
+                }
+            });
         }
     });
 }
@@ -627,16 +636,32 @@ async function saveResponse(chatId, data) {
     });
 }
 
-async function saveTestResult(chatId, testNumber, result) {
+async function saveTestResult(chatId, testNumber, result, recommendation = null) {
     return new Promise((resolve, reject) => {
-        db.run(
-            `UPDATE responses SET ${testNumber}_answers = ? WHERE chat_id = ?`,
-            [JSON.stringify(result), chatId],
-            (err) => {
-                if (err) reject(err);
-                else resolve();
+        const resultStr = JSON.stringify(result);
+        // Формируем запрос для обновления результата и рекомендации
+        const query = recommendation
+            ? `UPDATE responses 
+               SET ${testNumber}_answers = ?, recommendation = ? 
+               WHERE chat_id = ?`
+            : `UPDATE responses 
+               SET ${testNumber}_answers = ? 
+               WHERE chat_id = ?`;
+
+        // Выполняем запрос
+        const params = recommendation
+            ? [resultStr, recommendation, chatId]
+            : [resultStr, chatId];
+
+        db.run(query, params, (err) => {
+            if (err) {
+                console.error(`Error saving ${testNumber} results:`, err);
+                reject(err);
+            } else {
+                // console.log(`Successfully saved ${testNumber} results${recommendation ? ' and recommendation' : ''}`);
+                resolve();
             }
-        );
+        });
     });
 }
 
@@ -665,7 +690,8 @@ async function exportDatabase(chatId) {
                 { header: 'Результат теста 1', key: 'test1_answers' },
                 { header: 'Результат теста 2', key: 'test2_answers' },
                 { header: 'Результат теста 3', key: 'test3_answers' },
-                { header: 'Результат теста 4', key: 'test4_answers' }
+                { header: 'Результат теста 4', key: 'test4_answers' },
+                { header: 'Рекомендация', key: 'recommendation' }
             ];
 
             // Преобразуем результаты в читаемый формат
@@ -821,16 +847,11 @@ async function askTest3Question(chatId, part, questionIndex) {
     const questions = test.parts[part].questions;
     const question = questions[questionIndex];
     
-    const keyboard = question.options.map((option, index) => [{
-        text: option.text,
-        callback_data: `answer_test3_${part}_${questionIndex}_${index}`
-    }]);
-    
     const message = await bot.sendMessage(
         chatId,
         `${test.parts[part].title}\n\nВопрос ${questionIndex + 1}/${questions.length}:\n${question.text}`,
         {
-            reply_markup: { inline_keyboard: keyboard }
+            reply_markup: createTest3Keyboard(part, questionIndex)
         }
     );
     
@@ -843,6 +864,27 @@ function createAnswerKeyboard(testNumber, questionIndex) {
         inline_keyboard: test.options.map(option => [{
             text: option.text,
             callback_data: `answer_${testNumber}_${questionIndex}_${option.value}`
+        }])
+    };
+}
+function createTest3Keyboard(part, questionIndex) {
+    const test = tests.test3;
+    const question = test.parts[part].questions[questionIndex];
+    return {
+        inline_keyboard: question.options.map((option, index) => [{
+            text: option.text,
+            callback_data: `answer_test3_${part}_${questionIndex}_${index}`
+        }])
+    };
+}
+
+// Функция создания клавиатуры для теста 4
+function createTest4Keyboard(questionIndex) {
+    const test = tests.test4;
+    return {
+        inline_keyboard: test.options.map((option, index) => [{
+            text: option.text,
+            callback_data: `answer_test4_${questionIndex}_${index}`
         }])
     };
 }
@@ -967,16 +1009,11 @@ async function askTest4Question(chatId, questionIndex) {
     const test = tests.test4;
     const question = test.questions[questionIndex];
 
-    const keyboard = test.options.map((option, index) => [{
-        text: option.text,
-        callback_data: `answer_test4_${questionIndex}_${index}`
-    }]);
-
     const message = await bot.sendMessage(
         chatId,
         `Вопрос ${questionIndex + 1}/${test.questions.length}:\n${question}`,
         {
-            reply_markup: { inline_keyboard: keyboard }
+            reply_markup: createTest4Keyboard(questionIndex)
         }
     );
 
@@ -1013,29 +1050,30 @@ async function getTestResult(chatId, testNumber) {
         if (questionIndex + 1 < test.questions.length) {
             await askTest4Question(chatId, questionIndex + 1);
         } else {
+            // Анализируем результаты теста
             const test4Results = await analyzeTest4Results(userAnswers.get(chatId).test4);
-            await saveTestResult(chatId, 'test4', test4Results);
-            // await bot.sendMessage(chatId, test4Results.description);
 
-            // Получаем все результаты тестов
+            // Генерируем рекомендацию
+            await bot.sendMessage(chatId, 'Анализирую результаты и подбираю технику релаксации...');
             const testResults = {
                 test1: await getTestResult(chatId, 'test1'),
                 test2: await getTestResult(chatId, 'test2'),
                 test3: await getTestResult(chatId, 'test3'),
                 test4: test4Results
             };
-
-            await bot.sendMessage(chatId, 'Анализирую результаты и подбираю технику релаксации...');
-            
-            // Получаем рекомендацию
             const recommendation = await getChatGPTRecommendation(testResults);
-            
-            // Отправляем рекомендацию
+            // console.log('Generated recommendation:', recommendation);
+
+            // Сохраняем результат и рекомендацию
+            await saveTestResult(chatId, 'test4', test4Results, recommendation);
+
+            // Отправляем рекомендацию пользователю
             await bot.sendMessage(chatId, recommendation);
 
+            // Очищаем ответы и планируем напоминание
             clearAnswers(chatId);
-            
             scheduleReminder(chatId);
+
         }
     } catch (error) {
         console.error('Ошибка при обработке ответа:', error);
@@ -1090,37 +1128,67 @@ function getTest4Description({ score, level }) {
 }
 
 // Обработчики результатов тестов
-async function handleTestAnswer(chatId, testNumber, questionIndex, value) {
+// В функции handleTestAnswer
+async function handleTest1Answer(chatId, questionIndex, value) {
     try {
-        const test = tests[testNumber];
-        saveAnswer(chatId, testNumber, questionIndex, value);
-        const answers = getAnswers(chatId, testNumber);
+        const test = tests.test1;
+
+        if (!userAnswers.has(chatId)) {
+            userAnswers.set(chatId, {});
+        }
+
+        if (!userAnswers.get(chatId).test1) {
+            userAnswers.get(chatId).test1 = [];
+        }
+
+        userAnswers.get(chatId).test1[questionIndex] = value;
 
         if (questionIndex + 1 < test.questions.length) {
-            await askTestQuestion(chatId, testNumber, questionIndex + 1);
+            await askTestQuestion(chatId, 'test1', questionIndex + 1);
         } else {
-            let results;
-            if (testNumber === 'test1') {
-                results = await analyzeTest1Results(answers);
-                await saveTestResult(chatId, 'test1', results);
-                await bot.sendMessage(chatId, results.description);
-                await startSecondTest(chatId);
-            } else if (testNumber === 'test2') {
-                results = await analyzeTest2Results(answers);
-                await saveTestResult(chatId, 'test2', results);
-                await bot.sendMessage(chatId, results.description);
-                await startThirdTest(chatId);
-            }
+            const test1Results = await analyzeTest1Results(userAnswers.get(chatId).test1);
+            // console.log('Test 1 Results:', test1Results);
+            await saveTestResult(chatId, 'test1', test1Results);
+            await bot.sendMessage(chatId, test1Results.description);
+            await startSecondTest(chatId);
         }
     } catch (error) {
-        console.error('Ошибка при обработке ответа:', error);
+        console.error('Ошибка при обработке ответа теста 1:', error);
+        await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
+    }
+}
+
+async function handleTest2Answer(chatId, questionIndex, value) {
+    try {
+        const test = tests.test2;
+
+        if (!userAnswers.has(chatId)) {
+            userAnswers.set(chatId, {});
+        }
+
+        if (!userAnswers.get(chatId).test2) {
+            userAnswers.get(chatId).test2 = [];
+        }
+
+        userAnswers.get(chatId).test2[questionIndex] = value;
+
+        if (questionIndex + 1 < test.questions.length) {
+            await askTestQuestion(chatId, 'test2', questionIndex + 1);
+        } else {
+            const test2Results = await analyzeTest2Results(userAnswers.get(chatId).test2);
+            // console.log('Test 2 Results:', test2Results);
+            await saveTestResult(chatId, 'test2', test2Results);
+            await bot.sendMessage(chatId, test2Results.description);
+            await startThirdTest(chatId);
+        }
+    } catch (error) {
+        console.error('Ошибка при обработке ответа теста 2:', error);
         await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
     }
 }
 
 async function handleTest3Answer(chatId, part, questionIndex, optionIndex) {
     try {
-        // Инициализируем структуру ответов для теста 3, если её ещё нет
         if (!userAnswers.has(chatId)) {
             userAnswers.set(chatId, {});
         }
@@ -1133,7 +1201,6 @@ async function handleTest3Answer(chatId, part, questionIndex, optionIndex) {
             userAnswers.get(chatId).test3[part] = [];
         }
         
-        // Теперь безопасно сохраняем ответ
         userAnswers.get(chatId).test3[part][questionIndex] = parseInt(optionIndex);
 
         const questions = tests.test3.parts[part].questions;
@@ -1153,11 +1220,11 @@ async function handleTest3Answer(chatId, part, questionIndex, optionIndex) {
             await saveResponse(chatId, { message_id: message.message_id });
         } else {
             const results = await analyzeTest3Results(userAnswers.get(chatId).test3);
+            // console.log('Test 3 Results:', results); // Добавим логирование
             await saveTestResult(chatId, 'test3', results);
             await bot.sendMessage(chatId, results.description);
             await startFourthTest(chatId);
         }
-    
     } catch (error) {
         console.error('Ошибка при обработке ответа:', error);
         await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
@@ -1575,7 +1642,6 @@ bot.on('callback_query', async (query) => {
             await askTestQuestion(chatId, 'test2', 0);
         } else if (data === 'start_test_3_anxiety') {
             await askTest3Question(chatId, 'anxiety', 0);
-
         } else if (data === 'start_test_3_depression') {
             await askTest3Question(chatId, 'depression', 0);
         } else if (data === 'start_test_4') {
@@ -1586,15 +1652,18 @@ bot.on('callback_query', async (query) => {
         } else if (data.startsWith('answer_test3_')) {
             const [_, __, part, questionIndex, optionIndex] = data.split('_');
             await handleTest3Answer(chatId, part, parseInt(questionIndex), optionIndex);
-        } else if (data.startsWith('answer_')) {
-            const [_, testNumber, questionIndex, value] = data.split('_');
-            await handleTestAnswer(chatId, testNumber, parseInt(questionIndex), value);
+        } else if (data.startsWith('answer_test1_')) {
+            const [_, __, questionIndex, value] = data.split('_');
+            await handleTest1Answer(chatId, parseInt(questionIndex), value);
+        } else if (data.startsWith('answer_test2_')) {
+            const [_, __, questionIndex, value] = data.split('_');
+            await handleTest2Answer(chatId, parseInt(questionIndex), value);
         }
-    } catch (error) {
-        console.error('Ошибка в обработке callback_query:', error);
-        await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
-    }
-});
+        } catch (error) {
+            console.error('Ошибка в обработке callback_query:', error);
+            await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
+        }
+        });
 
 async function sendRelaxationTechniques(chatId, testResults) {
     const recommendation = await getChatGPTRecommendation(testResults);
