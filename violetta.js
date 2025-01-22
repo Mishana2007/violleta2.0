@@ -495,12 +495,44 @@ const test2Scales = {
 };
 
 const test4Scale = {
-    selfEsteem: {
-        low: [0, 10],
-        belowAverage: [11, 20],
-        average: [21, 30],
-        aboveAverage: [31, 40],
-        high: [41, 50]
+    categories: {
+        somatization: {
+            questions: [0, 3, 11, 26, 39, 41, 47],
+            description: {
+                low: "Низкий уровень соматизации",
+                medium: "Средний уровень соматизации",
+                high: "Высокий уровень соматизации"
+            }
+        },
+        anxiety: {
+            questions: [1, 16, 22, 32, 38, 48],
+            description: {
+                low: "Низкий уровень тревожности",
+                medium: "Средний уровень тревожности",
+                high: "Высокий уровень тревожности"
+            }
+        },
+        depression: {
+            questions: [14, 19, 28, 29, 30, 31],
+            description: {
+                low: "Низкий уровень депрессии",
+                medium: "Средний уровень депрессии",
+                high: "Высокий уровень депрессии"
+            }
+        },
+        interpersonal: {
+            questions: [5, 17, 35, 36, 37],
+            description: {
+                low: "Низкий уровень межличностной тревожности",
+                medium: "Средний уровень межличностной тревожности",
+                high: "Высокий уровень межличностной тревожности"
+            }
+        }
+    },
+    levels: {
+        low: { min: 0, max: 1.0 },
+        medium: { min: 1.01, max: 2.0 },
+        high: { min: 2.01, max: 4.0 }
     }
 };
 
@@ -607,7 +639,7 @@ async function getUserGender(chatId) {
 
 async function saveResponse(chatId, data) {
     return new Promise((resolve, reject) => {
-        // Сначала проверяем, существует ли пользователь
+        // Проверяем существование пользователя
         db.get('SELECT * FROM responses WHERE chat_id = ?', [chatId], (err, row) => {
             if (err) {
                 reject(err);
@@ -621,40 +653,44 @@ async function saveResponse(chatId, data) {
             ];
 
             if (row) {
-                // Если пользователь существует, обновляем только переданные поля
-                const updateFields = [];
-                const updateValues = [];
+                // Обновляем существующую запись
+                const updates = [];
+                const values = [];
 
-                fields.forEach(field => {
-                    if (data[field] !== undefined) {
-                        updateFields.push(`${field} = ?`);
-                        updateValues.push(data[field]);
+                Object.entries(data).forEach(([key, value]) => {
+                    if (fields.includes(key)) {
+                        updates.push(`${key} = ?`);
+                        values.push(value);
                     }
                 });
 
-                if (updateFields.length > 0) {
-                    const updateQuery = `
+                if (updates.length > 0) {
+                    const query = `
                         UPDATE responses 
-                        SET ${updateFields.join(', ')}, updated_at = CURRENT_TIMESTAMP
+                        SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = ?
                     `;
+                    values.push(chatId);
 
-                    db.run(updateQuery, [...updateValues, chatId], (err) => {
+                    db.run(query, values, (err) => {
                         if (err) reject(err);
                         else resolve();
                     });
                 } else {
-                    resolve(); // Нечего обновлять
+                    resolve();
                 }
             } else {
-                // Если это новый пользователь, создаем новую запись
-                const insertQuery = `
-                    INSERT INTO responses (
-                        chat_id, ${fields.join(', ')}
-                    ) VALUES (${new Array(fields.length + 1).fill('?').join(', ')})
+                // Создаем новую запись
+                const insertFields = ['chat_id', ...Object.keys(data).filter(key => fields.includes(key))];
+                const placeholders = new Array(insertFields.length).fill('?').join(', ');
+                const values = [chatId, ...insertFields.slice(1).map(field => data[field])];
+
+                const query = `
+                    INSERT INTO responses (${insertFields.join(', ')})
+                    VALUES (${placeholders})
                 `;
 
-                db.run(insertQuery, [chatId, ...fields.map(f => data[f])], (err) => {
+                db.run(query, values, (err) => {
                     if (err) reject(err);
                     else resolve();
                 });
@@ -715,74 +751,89 @@ function initializeDatabase() {
 // Updated save function for test results
 async function saveTestResult(chatId, testNumber, result, recommendation = null) {
     return new Promise((resolve, reject) => {
-        const resultStr = JSON.stringify(result);
-        let updateFields = [];
-        let params = [];
-
-        // Add basic result fields
-        updateFields.push(`${testNumber}_answers = ?`);
-        params.push(resultStr);
-
-        // Handle individual answers based on test type
-        if (testNumber === 'test3') {
-            // For test 3, we store anxiety and depression answers separately
-            if (userAnswers.get(chatId)?.test3?.anxiety) {
-                updateFields.push('test3_anxiety_answers = ?');
-                params.push(JSON.stringify(userAnswers.get(chatId).test3.anxiety));
-            }
-            if (userAnswers.get(chatId)?.test3?.depression) {
-                updateFields.push('test3_depression_answers = ?');
-                params.push(JSON.stringify(userAnswers.get(chatId).test3.depression));
-            }
-        } else {
-            // For other tests, store individual answers in their respective columns
-            const individualAnswers = JSON.stringify(userAnswers.get(chatId)?.[testNumber] || []);
-            updateFields.push(`${testNumber}_individual_answers = ?`);
-            params.push(individualAnswers);
-        }
-
-        // Add score fields based on test type
-        if (testNumber === 'test1') {
-            updateFields.push('test1_score = ?');
-            params.push(result.maxScore || 0);
-        } else if (testNumber === 'test2') {
-            updateFields.push('test2_score = ?');
-            params.push(Math.max(...Object.values(result.scores)) || 0);
-        } else if (testNumber === 'test3') {
-            updateFields.push('test3_anxiety_score = ?', 'test3_depression_score = ?');
-            params.push(result.anxiety || 0, result.depression || 0);
-        } else if (testNumber === 'test4') {
-            updateFields.push('test4_score = ?');
-            params.push(result.score || 0);
-        }
-
-        // Add recommendation if provided
-        if (recommendation) {
-            updateFields.push('recommendation = ?');
-            params.push(recommendation);
-        }
-
-        updateFields.push('updated_at = CURRENT_TIMESTAMP');
-
-        const query = `
-            UPDATE responses 
-            SET ${updateFields.join(', ')}
-            WHERE chat_id = ?
-        `;
-
-        // Add chatId as the last parameter
-        params.push(chatId);
-
-        db.run(query, params, function(err) {
+        // Проверяем существование пользователя
+        db.get('SELECT * FROM responses WHERE chat_id = ?', [chatId], (err, row) => {
             if (err) {
-                console.error(`Error saving ${testNumber} results:`, err);
                 reject(err);
-            } else {
-                if (this.changes === 0) {
-                    console.error(`No rows updated for chat_id ${chatId}`);
-                }
-                resolve();
+                return;
             }
+
+            if (!row) {
+                // Если пользователя нет, создаем новую запись
+                db.run('INSERT INTO responses (chat_id) VALUES (?)', [chatId], (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    // Рекурсивно вызываем функцию после создания записи
+                    saveTestResult(chatId, testNumber, result, recommendation).then(resolve).catch(reject);
+                });
+                return;
+            }
+
+            const resultStr = JSON.stringify(result);
+            const updateFields = [];
+            const params = [];
+
+            // Добавляем базовые поля результата
+            updateFields.push(`${testNumber}_answers = ?`);
+            params.push(resultStr);
+
+            // Обрабатываем индивидуальные ответы
+            if (testNumber === 'test3') {
+                if (userAnswers.get(chatId)?.test3?.anxiety) {
+                    updateFields.push('test3_anxiety_answers = ?');
+                    params.push(JSON.stringify(userAnswers.get(chatId).test3.anxiety));
+                }
+                if (userAnswers.get(chatId)?.test3?.depression) {
+                    updateFields.push('test3_depression_answers = ?');
+                    params.push(JSON.stringify(userAnswers.get(chatId).test3.depression));
+                }
+            } else {
+                const individualAnswers = JSON.stringify(userAnswers.get(chatId)?.[testNumber] || []);
+                updateFields.push(`${testNumber}_individual_answers = ?`);
+                params.push(individualAnswers);
+            }
+
+            // Добавляем поля оценок
+            if (testNumber === 'test1') {
+                updateFields.push('test1_score = ?');
+                params.push(result.maxScore || 0);
+            } else if (testNumber === 'test2') {
+                updateFields.push('test2_score = ?');
+                params.push(Math.max(...Object.values(result.scores)) || 0);
+            } else if (testNumber === 'test3') {
+                updateFields.push('test3_anxiety_score = ?', 'test3_depression_score = ?');
+                params.push(result.anxiety || 0, result.depression || 0);
+            } else if (testNumber === 'test4') {
+                updateFields.push('test4_score = ?');
+                params.push(result.score || 0);
+            }
+
+            // Добавляем рекомендацию если есть
+            if (recommendation) {
+                updateFields.push('recommendation = ?');
+                params.push(recommendation);
+            }
+
+            updateFields.push('updated_at = CURRENT_TIMESTAMP');
+
+            const query = `
+                UPDATE responses 
+                SET ${updateFields.join(', ')}
+                WHERE chat_id = ?
+            `;
+
+            params.push(chatId);
+
+            db.run(query, params, function(err) {
+                if (err) {
+                    console.error(`Error saving ${testNumber} results:`, err);
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            });
         });
     });
 }
@@ -1258,73 +1309,102 @@ async function getTestResult(chatId, testNumber) {
             userAnswers.get(chatId).test4 = [];
         }
 
+        // Сохраняем ответ (значение от 0 до 4)
         userAnswers.get(chatId).test4[questionIndex] = parseInt(optionIndex);
 
         if (questionIndex + 1 < test.questions.length) {
             await askTest4Question(chatId, questionIndex + 1);
         } else {
-            // First, analyze and save Test 4 results
+            console.log('Analyzing test 4 results for chat_id:', chatId);
             const test4Results = await analyzeTest4Results(userAnswers.get(chatId).test4);
+            
+            console.log('Saving test 4 results for chat_id:', chatId);
             await saveTestResult(chatId, 'test4', test4Results);
             
-            // Send Test 4 results to user
             await bot.sendMessage(chatId, 'Анализирую ваши ответы на четвертый тест...');
             await bot.sendMessage(chatId, test4Results.description);
             
-            // Now get all test results for comprehensive analysis
-            await bot.sendMessage(chatId, 'Теперь проанализирую результаты всех тестов и подберу персональные техники релаксации...');
-            
-            // Fetch all test results
-            const test1Results = await getTestResult(chatId, 'test1');
-            const test2Results = await getTestResult(chatId, 'test2');
-            const test3Results = await getTestResult(chatId, 'test3');
-            
-            // Prepare comprehensive results summary
+            // Получаем все результаты тестов
             const allResults = {
-                test1: test1Results,
-                test2: test2Results,
-                test3: test3Results,
+                test1: await getTestResult(chatId, 'test1'),
+                test2: await getTestResult(chatId, 'test2'),
+                test3: await getTestResult(chatId, 'test3'),
                 test4: test4Results
             };
             
-            // Generate and save GPT recommendation
+            await bot.sendMessage(chatId, 'Формирую итоговые рекомендации на основе всех тестов...');
             const recommendation = await getChatGPTRecommendation(allResults);
-            await db.run(
-                'UPDATE responses SET recommendation = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?',
-                [recommendation, chatId]
-            );
             
-            // Send final recommendation
+            // Сохраняем финальные результаты с рекомендацией
+            await saveTestResult(chatId, 'test4', test4Results, recommendation);
+            
             await bot.sendMessage(chatId, '🎯 Ваши персональные рекомендации на основе всех пройденных тестов:');
             await bot.sendMessage(chatId, recommendation);
             
-            // Cleanup and schedule
             clearAnswers(chatId);
             scheduleReminder(chatId);
         }
     } catch (error) {
-        console.error('Error handling test 4 answer:', error);
+        console.error('Ошибка при обработке ответа на тест 4:', error);
         await bot.sendMessage(chatId, 'Произошла ошибка. Пожалуйста, попробуйте снова /start');
     }
 }
 
 async function analyzeTest4Results(answers) {
-    const score = answers.reduce((sum, answer) => sum + answer, 0);
-
-    let level = '';
-    for (const [key, range] of Object.entries(test4Scale.selfEsteem)) {
-        if (score >= range[0] && score <= range[1]) {
-            level = key;
-            break;
+    try {
+        if (!answers || answers.length === 0) {
+            throw new Error('No answers to analyze');
         }
-    }
 
-    return {
-        score,
-        level,
-        description: getTest4Description({ score, level })
-    };
+        const score = answers.reduce((sum, answer) => sum + answer, 0);
+        const test4Ranges = {
+            low: [0, 50],
+            belowAverage: [51, 100],
+            average: [101, 150],
+            aboveAverage: [151, 200],
+            high: [201, 250]
+        };
+
+        let level = '';
+        for (const [key, range] of Object.entries(test4Ranges)) {
+            if (score >= range[0] && score <= range[1]) {
+                level = key;
+                break;
+            }
+        }
+
+        return {
+            score,
+            level,
+            description: getTest4Description({ score, level })
+        };
+    } catch (error) {
+        console.error('Error analyzing test 4:', error);
+        throw error;
+    }
 }
+
+// Функция описания результатов теста 4
+// function getTest4Description({ score, level }) {
+//     const descriptions = {
+//         veryLow: "У вас очень низкая самооценка. Рекомендуется работа с психологом для повышения уверенности в себе.",
+//         low: "У вас низкая самооценка. Важно научиться видеть свои сильные стороны и развивать уверенность в себе.",
+//         medium: "У вас средний уровень самооценки. Это нормально, но есть потенциал для развития.",
+//         high: "У вас высокая самооценка. Вы уверены в себе и своих способностях.",
+//         veryHigh: "У вас очень высокая самооценка. Важно сохранять баланс между уверенностью в себе и адекватной оценкой ситуации."
+//     };
+
+//     return `📊 Результаты оценки самооценки\n\n` +
+//            `Общий балл: ${score}\n` +
+//            `Уровень: ${level}\n\n` +
+//            `${descriptions[level] || 'Не удалось определить уровень'}\n\n`;
+// }
+
+
+
+
+
+
 
 // async function analyzeTest4Results(answers) {
 //     const score = answers.reduce((sum, answer) => sum + answer, 0);
@@ -1362,11 +1442,11 @@ bot.onText(/\/export/, async (msg) => {
 
 function getTest4Description({ score, level }) {
     const descriptions = {
-        low: 'У вас низкая самооценка. Вы склонны недооценивать свои способности и достижения, часто испытываете неуверенность в себе. Рекомендуется работать над повышением самооценки и уверенности в своих силах.',
-        belowAverage: 'Ваша самооценка ниже среднего. Вы можете испытывать сомнения в своих возможностях и не всегда верите в успех. Старайтесь концентрироваться на своих сильных сторонах и развивать позитивное отношение к себе.',
-        average: 'У вас средний уровень самооценки. Вы в целом уверены в себе, но иногда можете испытывать сомнения. Продолжайте работать над укреплением своих сильных сторон и не бойтесь браться за новые задачи.',
-        aboveAverage: 'Ваша самооценка выше среднего. Вы уверены в своих силах, способны ставить перед собой цели и достигать их. Сохраняйте позитивный настрой и не забывайте о постоянном развитии.',
-        high: 'У вас высокая самооценка. Вы полностью уверены в себе, своих способностях и возможностях. Вы легко справляетесь с трудностями и готовы браться за любые задачи. Продолжайте в том же духе!'
+        low: 'У вас низкая самооценка. Вы склонны недооценивать свои способности и достижения, часто испытываете неуверенность в себе. Рекомендуется работать над повышением самооценки.',
+        belowAverage: 'Ваша самооценка ниже среднего. Вы можете испытывать сомнения в своих возможностях. Старайтесь развивать позитивное отношение к себе.',
+        average: 'У вас средний уровень самооценки. Вы в целом уверены в себе, но иногда можете испытывать сомнения.',
+        aboveAverage: 'Ваша самооценка выше среднего. Вы уверены в своих силах, способны ставить и достигать цели.',
+        high: 'У вас высокая самооценка. Вы полностью уверены в себе, своих способностях и возможностях.'
     };
 
     return `📊 Результаты анализа самооценки\n\nУровень самооценки: ${descriptions[level]}`;
