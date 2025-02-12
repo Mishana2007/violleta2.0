@@ -427,6 +427,8 @@ async function testSCL90R(chatId) {
         
         // Отправляем результаты
         await bot.sendMessage(chatId, test4Results.description);
+
+
         
         // Получаем все результаты тестов
         const allResults = {
@@ -439,10 +441,18 @@ async function testSCL90R(chatId) {
         // Генерируем рекомендации
         const recommendation = await getChatGPTRecommendation(allResults);
         await saveTestResult(chatId, 'test4', test4Results, recommendation);
+
+        
         
         // Отправляем рекомендации
         await bot.sendMessage(chatId, '🎯 Ваши персональные рекомендации на основе всех пройденных тестов:');
         await bot.sendMessage(chatId, recommendation);
+
+        // Пример сохранения рекомендации
+await db.run(
+    "UPDATE responses SET recommendation = ? WHERE chat_id = ?",
+    [recommendation, chatId]
+);
         
         // Планируем первое напоминание через 1 минуту
         scheduleReminder(chatId);
@@ -654,6 +664,87 @@ async function saveResponse(chatId, data) {
                 });
             }
         });
+    });
+}
+
+// Функция для отправки напоминаний
+async function sendPeriodicReminders() {
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    
+    const query = `
+        SELECT chat_id 
+        FROM responses 
+        WHERE 
+            test1_score > 0 AND
+            test2_score > 0 AND
+            test3_anxiety_score > 0 AND
+            test3_depression_score > 0 AND
+            test4_score > 0 AND
+            (last_reminder IS NULL OR last_reminder < ?)
+    `;
+
+    db.all(query, [twoDaysAgo.toISOString()], async (err, rows) => {
+        if (err) return console.error('Database error:', err);
+
+        for (const row of rows) {
+            try {
+                await bot.sendMessage(
+                    row.chat_id,
+                    '🕑 Прошло 2 дня! Самое время повторить технику релаксации:',
+                    {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: 'Напомнить позже', callback_data: `remind_later_${row.chat_id}` },
+                                    { text: 'Пройти сейчас', callback_data: `new_session_${row.chat_id}` }
+                                ]
+                            ]
+                        }
+                    }
+                );
+                
+                // Обновляем время последнего напоминания
+                db.run(
+                    `UPDATE responses 
+                    SET last_reminder = CURRENT_TIMESTAMP 
+                    WHERE chat_id = ?`,
+                    [row.chat_id]
+                );
+
+            } catch (error) {
+                if (error.response?.error_code === 403) {
+                    await clearUserData(row.chat_id);
+                }
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+    });
+}
+
+// Расписание на каждые 2 дня в 10:00
+const rule = new schedule.RecurrenceRule();
+rule.hour = 10;
+rule.minute = 0;
+rule.dayOfWeek = new schedule.Range(0, 6, 2); // Каждые 2 дня
+rule.tz = 'Europe/Moscow';
+
+schedule.scheduleJob(rule, () => {
+    console.log('Запуск двухдневной рассылки...');
+    sendPeriodicReminders();
+});
+
+// Обновленная функция clearUserData
+async function clearUserData(chatId) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `DELETE FROM responses 
+            WHERE chat_id = ?`,
+            [chatId],
+            (err) => {
+                if (err) reject(err);
+                else resolve();
+            }
+        );
     });
 }
 
@@ -1843,7 +1934,7 @@ function scheduleReminder(chatId) {
                     reminderTimeouts.delete(chatId);
                 }
             }
-        }, 60 * 1000); // 1 минута
+        }, 2 * 24 * 60 * 60 * 1000); // 1 минута
 
         reminderTimeouts.set(chatId, timer);
         console.log(`Напоминание запланировано для ${chatId}`);
@@ -1860,7 +1951,7 @@ process.on('SIGINT', () => {
 
 
 // Обработчик callback_query
-const reminderTimeouts = new Map();
+
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
@@ -1876,8 +1967,8 @@ bot.on('callback_query', async (query) => {
         // Обработка основных действий
         if (data.startsWith('not_ready_')) {
             await bot.answerCallbackQuery(query.id);
-            await bot.sendMessage(chatId, '⏳ Хорошо, напомню вам через 1 час!');
-            scheduleReminder(chatId, 60 * 60 * 1000); // Через 1 час
+            await bot.sendMessage(chatId, '⏳ Хорошо, напомню вам через 2 дня!');
+            scheduleReminder(chatId, 2 * 24 * 60 * 60 * 1000);
         } 
         else if (data.startsWith('ready_')) {
             await bot.answerCallbackQuery(query.id);
@@ -1885,8 +1976,8 @@ bot.on('callback_query', async (query) => {
         }
         else if (data.startsWith('remind_later_')) {
             await bot.answerCallbackQuery(query.id);
-            await bot.sendMessage(chatId, '⏱️ Хорошо, напомню через 30 минут!');
-            scheduleReminder(chatId, 30 * 60 * 1000);
+            await bot.sendMessage(chatId, '⏱️ Хорошо, напомню через 2 дня!');
+            scheduleReminder(chatId, 2 * 24 * 60 * 60 * 1000);
         }
         else if (data.startsWith('new_technique_')) {
             await bot.answerCallbackQuery(query.id);
@@ -1981,6 +2072,35 @@ bot.on('callback_query', async (query) => {
             const [_, __, questionIndex, value] = data.split('_');
             await handleTest2Answer(chatId, parseInt(questionIndex), value);
         }
+
+        // В обработчике callback_query
+else if (data.startsWith('new_session_')) {
+    const chatId = data.split('_')[2]; // Извлекаем chat_id из callback_data
+    
+    try {
+        // Получаем рекомендацию из базы
+        const recommendation = await new Promise((resolve, reject) => {
+            db.get(
+                "SELECT recommendation FROM responses WHERE chat_id = ?",
+                [chatId],
+                (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row?.recommendation || "");
+                }
+            );
+        });
+
+        // Отправляем пользователю
+        await bot.sendMessage(
+            chatId, 
+            "🧘 Повторите технику:\n\n" + recommendation
+        );
+
+    } catch (error) {
+        console.error("Ошибка:", error);
+        await bot.sendMessage(chatId, "❌ Не удалось загрузить рекомендацию");
+    }
+}
         
     } catch (error) {
         console.error('❌ Ошибка обработки callback:', error);
@@ -2023,7 +2143,7 @@ async function handleNewRecommendation(chatId) {
     }
 }
 
-function scheduleReminder(chatId, delay = 60 * 1000) {
+function scheduleReminder(chatId, delay = 2 * 24 * 60 * 60 * 1000) { 
     // Очистка предыдущего таймера
     if (reminderTimeouts.has(chatId)) {
         clearTimeout(reminderTimeouts.get(chatId));
